@@ -1,83 +1,89 @@
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
-from datetime import datetime
-# Assuming your SQLAlchemy models are defined in Database.py
-from Database import Symptom, Question, Option, Answer, symptom_question_relation, question_survey_relation
-from semopy import Model
 import pandas as pd
-import numpy as np
-from SymptomSurveyOptionFetcher import SymptomSurveyOptionFetcher
+from semopy import Model
+from semopy.inspector import inspect
 
-class UserSymptomModeler:
-    def __init__(self, user_id):
-        self.user_id = user_id
-        self.engine = create_engine('sqlite:///survey_system.db')
-        Session = sessionmaker(bind=self.engine)
-        self.session = Session()
-        self.survey_id = 1  # Assuming survey_id=1 is of interest
+class DICalculation:
+    def __init__(self, data_path, symptom_to_questions):
+        self.data_path = data_path
+        self.symptom_to_questions = symptom_to_questions  # Now part of the object
+        self.data = None
+        self.model = None
+        self.results = None
 
-    def fetch_data(self, symptom_id):
-        # Placeholder for actual data fetching logic
-        fetcher = SymptomSurveyOptionFetcher(self.session)
-        return fetcher.fetch_latest_options_for_symptom_and_survey(self.user_id, symptom_id, self.survey_id)
+    def load_data(self):
+        self.data = pd.read_csv(self.data_path).iloc[:, 1:]
+        return self.data
 
-    def fit_models(self):
-        results = {}
-        # Assuming 8 symptoms for simplicity
-        for symptom_id in range(1, 9):
-            symptom_data = self.fetch_data(symptom_id)
-            for date, option_ids in symptom_data.items():
-                # Convert option_ids to DataFrame
-                data = {f'Q{symptom_id}_{index}': [option] for index, option in enumerate(option_ids, start=1)}
-                df = pd.DataFrame(data)
-                df = df.add_prefix(f"S{symptom_id}_")
-                
-                # Construct model description
-                specific_factors = " + ".join(df.columns)
-                model_desc = f"S{symptom_id} =~ {specific_factors}\n"
-
-                # Print the data and model description for inspection
-                print(f"Data for Symptom S{symptom_id} on Date {date}:")
-                print(df)
-                print("Model Description:")
-                print(model_desc)
-
-                # Fit the model
-                model = Model(model_desc)
-                try:
-                    model.load_dataset(df)
-                    model.fit()
-                    estimates = model.inspect()
-                    print("Model Estimates:\n", estimates[['lval', 'rval', 'Estimate']])
-                    results[date][f'Symptom_{symptom_id}'] = estimates
-                except Exception as e:
-                    print(f"Error fitting model for Symptom S{symptom_id} on Date {date}: {e}")
-                    results[date][f'Symptom_{symptom_id}'] = 'Error during model fitting.'
-
-        return results
-
-
-    def construct_model_description(self, symptom_questions_map):
-        model_desc = ""
-        for symptom_id, num_questions in symptom_questions_map.items():
-            questions_desc = " + ".join([f'Q{symptom_id}_{i}' for i in range(1, num_questions + 1)])
-            model_desc += f"S{symptom_id} =~ {questions_desc}\n"
+    def define_model(self):
+        model_desc = "G =~ "
+        model_desc += " + ".join([f"S{symptom}_{qsr}" for symptom, qsrs in self.symptom_to_questions.items() for qsr in qsrs])
         
-        general_factor_desc = "G =~ " + " + ".join([f'S{i}' for i in symptom_questions_map.keys()])
-        model_desc += general_factor_desc
-
+        for symptom, qsrs in self.symptom_to_questions.items():
+            specific_factor = f"S{symptom} =~ " + " + ".join([f"S{symptom}_{qsr}" for qsr in qsrs])
+            model_desc += "\n" + specific_factor
         return model_desc
 
-    def run(self):
-        return self.fit_models()
+    def build_model(self, model_description):
+        self.model = Model(model_description)
 
-# Example usage
+    def fit_model(self):
+        self.results = self.model.fit(self.data)
+        return self.results
+
+    def get_estimates(self):
+        return inspect(self.model)
+    
+    def calculate_scores(self):
+        estimates = inspect(self.model)
+        
+        # Initialize columns for scores to 0
+        for symptom in self.symptom_to_questions:
+            self.data[f'Score_S{symptom}'] = 0
+        
+        self.data['DI_score'] = 0
+        
+        # Step 1: Calculate scores for each S{symptom}
+        for symptom, qsrs in self.symptom_to_questions.items():
+            for qsr in qsrs:
+                estimate_row = estimates.loc[(estimates['lval'] == f'S{symptom}_{qsr}') & (estimates['rval'] == f'S{symptom}')]
+                if not estimate_row.empty:
+                    estimate = estimate_row['Estimate'].values[0]
+                    self.data[f'Score_S{symptom}'] += estimate * self.data[f'S{symptom}_{qsr}']
+        
+        # Step 2: Calculate score for G using scores from Step 1
+        for symptom in self.symptom_to_questions:
+            estimate_row = estimates.loc[(estimates['lval'] == f'S{symptom}') & (estimates['rval'] == 'G')]
+            if not estimate_row.empty:
+                estimate = estimate_row['Estimate'].values[0]
+                self.data['DI_score'] += estimate * self.data[f'Score_S{symptom}']
+                print(f"DI Score Contribution from Symptom {symptom}, Estimate: {estimate}, lval: {estimate_row['lval'].values[0]}, rval: {estimate_row['rval'].values[0]}, op: {estimate_row['op'].values[0]}")
+
+        
+
+# Usage
 if __name__ == "__main__":
-    user_id = 2  # Example user ID
-    modeler = UserSymptomModeler(user_id)
-    results = modeler.run()
-
-    for date, model_results in results.items():
-        print(f"Date: {date}")
-        for symptom, output in model_results.items():
-            print(f"  {symptom}: {output}")
+    data_path = 'survey_earliest_answers.csv'
+    symptom_to_questions = {
+        1: [6, 11, 13, 24, 39],
+        2: [3, 9, 11, 12, 18, 20, 15, 32, 40],
+        3: [2, 5, 11, 22, 25, 28, 30],
+        4: [10, 33, 36],
+        5: [4, 8, 16],
+        6: [21, 23, 27, 35, 42, 43, 44],
+        7: [1, 7, 14, 26],
+        8: [17, 19, 31, 34, 37],
+    }
+    
+    builder = DICalculation(data_path, symptom_to_questions)
+    df = builder.load_data()
+    
+    model_description = builder.define_model()
+    builder.build_model(model_description)
+    
+    builder.fit_model()
+    builder.calculate_scores()  # Calculate scores after fitting the model
+    
+    if 'DI_score' in builder.data.columns:
+        print(builder.data[['DI_score']])
+    else:
+        print("DI_score column not found. Ensure calculate_scores method is correctly implemented.")
